@@ -1,6 +1,5 @@
 const std = @import("std");
-const InnerNode = @import("./inner_node.zig").InnerNode;
-const LeafNode = @import("./leaf_node.zig").LeafNode;
+const math = std.math;
 const Pager = @import("./pager.zig").Pager;
 const Allocator = std.mem.Allocator;
 
@@ -8,7 +7,7 @@ pub const BTreeNode = union(enum) {
     inner: InnerNode,
     leaf: LeafNode,
 };
-pub const PageSize = 4096;
+pub const PageSize = 128;
 pub const NodeSize = PageSize - 4;
 comptime {
     std.debug.assert(@sizeOf(BTreeNode) == PageSize);
@@ -80,6 +79,7 @@ pub const BTree = struct {
                     var new_leaf = leaf.split();
                     const promotee = new_leaf.slots()[0].key;
                     // Put kv into correct leaf.
+                    // try (if (key > promotee) &new_leaf else leaf).insert(key, val);
                     try (if (key > promotee) &new_leaf else leaf).insert(key, val);
                     // Allocate a new leaf page and fix leafs' right pointers.
                     const new_page_ptr = try self.pager.append_page(.{ .leaf = new_leaf });
@@ -104,7 +104,7 @@ pub const BTree = struct {
         var page = self.pager.read_page(page_id) catch return null;
         switch (page) {
             .inner => |*inner| {
-                const ptr = inner.findKey(key);
+                const ptr = inner.getPtr(key);
                 return self._select(ptr, key);
             },
             .leaf => |*leaf| {
@@ -113,11 +113,11 @@ pub const BTree = struct {
         }
     }
 
-    const RemoveOp = union(enum) {
-        remove: void,
-        borrow: struct { new_key: u32 },
-        merge: void,
-    };
+    // const RemoveOp = union(enum) {
+    //     remove: void,
+    //     borrow: struct { new_key: u32 },
+    //     merge: void,
+    // };
 
     // pub fn remove(self: Self, key: u32) !void {
     //     switch (try self._remove(self.page_id, key)) {
@@ -129,22 +129,25 @@ pub const BTree = struct {
     //     var page = try self.pager.read_page(page_id);
     //     const res: RemoveOp = switch (page) {
     //         .inner => |*inner| blk: {
-    //             // Remove key lower in tree/
-    //             const slot_i = inner.findKeyLoc(key);
-    //             switch (try self._remove(inner.slots()[slot_i].ptr, key)) {
+    //             // Remove key lower in tree.
+    //             const maybe_i = inner.findKeyLoc(key);
+    //             const i = (maybe_i orelse 0) + 1;
+    //             const foo = try self._remove(inner.locToPtr(maybe_i), key);
+    //             std.debug.print("{}\n", .{foo});
+    //             switch (foo) {
     //                 .remove => {},
     //                 .borrow => |result| {
     //                     // Set next slot to the new key.
-    //                     if (slot_i + 1 < inner.slots().len) {
-    //                         inner.slots()[slot_i + 1].key = result.new_key;
+    //                     if (i < inner.slots().len) {
+    //                         inner.slots()[i].key = result.new_key;
     //                     }
     //                     break :blk .{ .remove = {} };
     //                 },
     //                 .merge => {
     //                     // Remove next slot.
-    //                     if (slot_i + 1 < inner.slots().len) {
+    //                     if (i < inner.slots().len) {
     //                         var arr = inner.slotArr();
-    //                         _ = arr.orderedRemove(slot_i + 1);
+    //                         _ = arr.orderedRemove(i);
     //                         inner.h.len -= 1;
     //                     }
     //                     // Done?
@@ -226,4 +229,276 @@ pub const BTree = struct {
     //     try self.pager.write_page(page_id, page);
     //     return res;
     // }
+};
+
+pub const InnerNode = extern struct {
+    h: Header,
+    __slots_alignment: [__n_slots_alignment]u8 = undefined,
+    _slots: [(NodeSize - __n_slots_alignment - @sizeOf(Header))]u8 = undefined,
+
+    const Self = @This();
+
+    const Header = extern struct {
+        right_page: i32 = -1,
+        lower_page: u32,
+        len: u16 = 0,
+    };
+
+    pub const Slot = struct {
+        key: u32,
+        ptr: u32,
+    };
+
+    // pub fn insert() {}
+    // pub fn select() {}
+
+    const __n_slots_alignment = 0;
+    comptime {
+        const _slots = "_slots";
+        const misalignment = @offsetOf(Self, _slots) % @alignOf(Slot);
+        if (misalignment != 0)
+            @compileError(std.fmt.comptimePrint(
+                "for " ++ _slots ++ " to be cast as []InnerSlot, " ++ _slots ++ " is misalignment by {d} bytes",
+                .{misalignment},
+            ));
+    }
+    pub fn slots(self: *Self) []Slot {
+        return @alignCast(std.mem.bytesAsSlice(Slot, self._slots[0 .. self.h.len * @sizeOf(Slot)]));
+    }
+
+    pub fn slotArr(self: *Self) std.ArrayListUnmanaged(Slot) {
+        var arr = std.ArrayListUnmanaged(Slot).fromOwnedSlice(self.slots());
+        arr.capacity = self.cap();
+        return arr;
+    }
+
+    pub fn cap(self: Self) u16 {
+        return self._slots.len / @sizeOf(Slot);
+    }
+
+    pub fn getPtr(self: *Self, key: u32) u32 {
+        const maybe_i = self.findKeyLoc(key);
+        return self.locToPtr(maybe_i);
+    }
+
+    pub fn findKeyLoc(self: *Self, key: u32) ?usize {
+        const ss = self.slots();
+        const i = std.sort.upperBound(Slot, key, ss, {}, struct {
+            fn lt(_: void, lhs: u32, rhs: Slot) bool {
+                return lhs < rhs.key;
+            }
+        }.lt);
+        return if (i == 0) null else i - 1;
+    }
+
+    pub fn locToPtr(self: *Self, maybe_i: ?usize) u32 {
+        return if (maybe_i) |i| self.slots()[i].ptr else self.h.lower_page;
+    }
+
+    pub fn print(self: *Self) void {
+        // const digits = std.fmt.digits2(@intCast(self.slots()[self.h.len - 1].key));
+        const digits = "3";
+        for (self.slots()) |s| {
+            std.debug.print("  {d:0>0" ++ digits ++ "}", .{s.key});
+        }
+        std.debug.print("\n  /", .{});
+        for (self.slots()) |_| {
+            std.debug.print(" \\{s:0" ++ digits ++ "}", .{""});
+        }
+        std.debug.print("\n", .{});
+        std.debug.print("{d:0>" ++ digits ++ "}", .{self.h.lower_page});
+        for (self.slots()) |s| {
+            std.debug.print("  {d:0>" ++ digits ++ "}", .{s.ptr});
+        }
+        std.debug.print("\n", .{});
+    }
+};
+
+pub const LeafNode = extern struct {
+    h: Header = .{},
+    buf: [NodeSize - @sizeOf(Header)]u8 = undefined,
+
+    const Header = extern struct {
+        right_page: i32 = -1,
+        slot_len: u16 = 0, // The number of slot being used in a the page.
+        cell_buf_len: u16 = 0, // The length used for the cell buffer.
+        num_fragmented_bytes: u16 = 0, // Number of fragmented bytes in cell buffer.
+    };
+
+    const Slot = struct {
+        key: u32,
+        pos: u16,
+        len: u16,
+
+        fn insertionSize(val: []const u8) !u16 {
+            return if (val.len > math.maxInt(u16))
+                error.ValueToLarge
+            else
+                @intCast(@sizeOf(@This()) + val.len);
+        }
+    };
+
+    const Self = @This();
+
+    pub fn insert(self: *Self, key: u32, val: []const u8) !void {
+        // Get insertion size (fails if val.len > sizeof Slot.len).
+        const insertion_size = try Slot.insertionSize(val);
+        // Find key.
+        const slot_idx = self.getSlotIndex(key);
+        if (slot_idx < self.h.slot_len) {
+            var slot = &self.slots()[slot_idx];
+            // Update value in place and update free space counter.
+            const new_slot_len: u16 = @intCast(val.len);
+            if (new_slot_len <= slot.len) {
+                self.h.num_fragmented_bytes += slot.len - new_slot_len;
+                slot.len = new_slot_len;
+                @memcpy(self.getSlotValue(slot.*), val);
+                return;
+            }
+            // Try to make space for new value.
+            else {
+                if (!(self.remaining_space() > insertion_size - slot.len)) {
+                    return error.OutOfSpace;
+                }
+                var arr = self.slotArr();
+                _ = arr.orderedRemove(slot_idx);
+                self.compact();
+            }
+        }
+        // New key, do we have enought space?
+        else {
+            if (self.remaining_buf() > insertion_size) {
+                // Have enought space to append, do nothing.
+            } else if (self.remaining_space() > insertion_size) {
+                self.compact();
+            } else {
+                return error.OutOfSpace;
+            }
+        }
+        // Prepend new value by growing the cell buffer from the left.
+        self.h.cell_buf_len += @intCast(val.len);
+        const new_slot = Slot{
+            .key = key,
+            .pos = @as(u16, @intCast(self.buf.len)) - self.h.cell_buf_len,
+            .len = @intCast(val.len),
+        };
+        const cell_buf = self.buf[new_slot.pos..];
+        @memcpy(cell_buf[0..val.len], val);
+        // Insert new slot in sorted order into slot array.
+        {
+            self.h.slot_len += 1;
+            var arr = self.slotArr();
+            arr.insertAssumeCapacity(slot_idx, new_slot);
+        }
+    }
+
+    pub fn select(self: *Self, key: u32) ?[]const u8 {
+        const maybe_slot_idx = std.sort.binarySearch(Slot, key, self.slots(), {}, struct {
+            fn bs(_: void, lhs: u32, rhs: Slot) math.Order {
+                return math.order(lhs, rhs.key);
+            }
+        }.bs);
+        const slot_idx = maybe_slot_idx orelse return null;
+        const slot = self.slots()[slot_idx];
+        return self.getSlotValue(slot);
+    }
+
+    pub fn remove(self: *Self, key: u32) !void {
+        const maybe_slot_idx = std.sort.binarySearch(Slot, key, self.slots(), {}, struct {
+            fn bs(_: void, lhs: u32, rhs: Slot) math.Order {
+                return math.order(lhs, rhs.key);
+            }
+        }.bs);
+        const slot_idx = maybe_slot_idx orelse {
+            return error.KeyNotFound;
+        };
+        const slot = self.slots()[slot_idx];
+        {
+            var arr = self.slotArr();
+            _ = arr.orderedRemove(slot_idx);
+            self.h.slot_len -= 1;
+        }
+        self.h.num_fragmented_bytes += slot.len;
+        return;
+    }
+
+    // compact will compact all of the cell data and set the number of
+    // fragmented bytes to 0.
+    // XXX: could avoid a tmp buffer if we had cells as a linked list.
+    pub fn compact(self: *Self) void {
+        var tmp: [@sizeOf(@TypeOf(self.buf))]u8 = undefined; // clone self.buf
+        var pos: u16 = self.buf.len;
+        for (self.slots()) |*slot| {
+            const val = self.getSlotValue(slot.*);
+            pos -= @as(u16, @intCast(val.len));
+            @memcpy(tmp[pos..][0..val.len], val);
+            slot.pos = pos;
+        }
+        @memcpy(self.buf[pos..], tmp[pos..]);
+        self.h.num_fragmented_bytes = 0;
+        self.h.cell_buf_len = @intCast(self.buf[pos..].len);
+    }
+
+    pub fn split(self: *Self) Self {
+        var other = Self{};
+        const leaf_slot_len_new = self.h.slot_len / 2;
+        for (self.slots()[leaf_slot_len_new..]) |slot| {
+            // Add slot and cell.
+            other.h.slot_len += 1;
+            const new_slot = &other.slots()[other.h.slot_len - 1];
+            const v = self.getSlotValue(slot);
+            other.h.cell_buf_len += @intCast(v.len);
+            new_slot.* = .{
+                .key = slot.key,
+                .pos = @as(u16, @intCast(other.buf.len)) - other.h.cell_buf_len,
+                .len = @intCast(v.len),
+            };
+            @memcpy(other.buf[new_slot.pos..][0..v.len], v);
+        }
+        // Remove rest of slots, compact, and retry insert.
+        self.h.slot_len = leaf_slot_len_new;
+        self.compact();
+        return other;
+    }
+
+    // Ensure offset of buf aligned for slots.
+    comptime {
+        const misalignment = @offsetOf(Self, "buf") % @alignOf(Slot);
+        if (misalignment != 0)
+            @compileError(std.fmt.comptimePrint(
+                "for buf to be cast as []Slot, buf is misalignment by {d} bytes",
+                .{misalignment},
+            ));
+    }
+    pub fn slots(self: *Self) []Slot {
+        return @alignCast(std.mem.bytesAsSlice(Slot, self.buf[0 .. self.h.slot_len * @sizeOf(Slot)]));
+    }
+
+    pub fn slotArr(self: *Self) std.ArrayListUnmanaged(Slot) {
+        var arr = std.ArrayListUnmanaged(Slot)
+            .fromOwnedSlice(self.slots());
+        const max_slots = self.buf.len / @sizeOf(Slot);
+        arr.capacity = max_slots;
+        return arr;
+    }
+
+    pub fn getSlotIndex(self: *Self, key: u32) usize {
+        return std.sort.upperBound(Slot, key, self.slots(), {}, struct {
+            fn lte(_: void, lhs: u32, rhs: Slot) bool {
+                return lhs <= rhs.key;
+            }
+        }.lte);
+    }
+
+    pub fn getSlotValue(self: *Self, slot: Slot) []u8 {
+        return self.buf[slot.pos..][0..slot.len];
+    }
+
+    pub fn remaining_buf(self: Self) u16 {
+        const buf_len_used = self.h.slot_len * @sizeOf(Slot) + self.h.cell_buf_len;
+        return @as(u16, @intCast(self.buf.len)) - buf_len_used;
+    }
+    pub fn remaining_space(self: Self) u16 {
+        return self.remaining_buf() + self.h.num_fragmented_bytes;
+    }
 };

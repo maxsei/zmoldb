@@ -1,7 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const BTreeNode = @import("./btree.zig").BTreeNode;
-const LeafNode = @import("./leaf_node.zig").LeafNode;
 
 pub const Pager = struct {
     allocator: Allocator,
@@ -20,11 +19,7 @@ pub const Pager = struct {
 
     pub fn read_page(self: *Self, page_id: u32) !BTreeNode {
         return self.kv.get(page_id) orelse {
-            if (page_id != 0) return error.PageFault;
-            // TODO: remove this once we start using the disk <06-10-24, Max Schulte> //
-            const res = try self.kv.getOrPut(page_id);
-            res.value_ptr.* = .{ .leaf = LeafNode{} };
-            return res.value_ptr.*;
+            return error.PageFault;
         };
     }
 

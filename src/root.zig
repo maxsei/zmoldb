@@ -7,7 +7,8 @@ const Pager = @import("./pager.zig").Pager;
 test "BTree many insert, remove, and select smoke test" {
     var pager = Pager.init(std.testing.allocator);
     defer pager.deinit();
-    var btree = BTree{ .page_id = pager.pages, .pager = &pager };
+    const root_page_id = try pager.append_page(.{ .leaf = .{} });
+    var btree = BTree{ .page_id = root_page_id, .pager = &pager };
     var rng = std.rand.DefaultPrng.init(0);
     var vv: [12000]?[16]u8 = undefined;
     // Set values and btree.
@@ -20,7 +21,6 @@ test "BTree many insert, remove, and select smoke test" {
             v.* = buf;
             try btree.insert(key, &buf);
         }
-        // TODO: enable this in the test.
         // if (rng.random().boolean()) {
         //     try btree.remove(key);
         //     v.* = null;
